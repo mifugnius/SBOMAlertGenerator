@@ -30,7 +30,4 @@ def send_email(email_receiver, content):
         server.send_message(email)
     
     print(f"Email Sent to {email_receiver}")
-
-
-
  

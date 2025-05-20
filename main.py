@@ -47,14 +47,13 @@ def clone_repository(repo_url, branch):
 
 	return directory_clone_to
 
-def generate_SBOM(repo_url):
-	result = subprocess.run(["syft", get_repository_local_directory_name(repo_url), "-o", "json"], stdout=subprocess.PIPE, check=True)
+def generate_SBOM(directory):
+	result = subprocess.run(["syft", directory, "-o", "json"], stdout=subprocess.PIPE, check=True)
 	
 	with open(SBOM_FILE_NAME, "wb") as f:
 		f.write(result.stdout)
 
 def generate_html_table(vulnerabilities_table_string):
-	print(vulnerabilities_table_string)
 	lines = vulnerabilities_table_string.strip().split("\n")
 	html = '<table border="1" cellpadding="5" cellspacing="0" style="border-collapse:collapse; font-family:sans-serif;">'
 
@@ -89,22 +88,28 @@ def repository_has_vulnerabilities(output):
 def main():
 	parser = argparse.ArgumentParser(description="SBOMAlertGenerator: Generate Alerts for a Repository")
 
-	parser.add_argument('repository_url', type=str, help='URL of the Git repository to analyze')
+	parser.add_argument('--repository', type=str, help='URL of the Git repository to analyze')
 	parser.add_argument('--branch', type=str, help='Repository branch to analyze')
-	parser.add_argument('--no-email', action='store_false', dest='send_email', help='Disable sending email')
-	parser.add_argument('--email-address', type=str, help='Email address to send alerts to')
+	parser.add_argument('--no-email', action='store_false', dest='send_email', help='Disable sending email (used when --email-address is not specified)')
+	parser.add_argument('--email-address', type=str, help='Email address to send alerts to (used when --no-email is not specified)')
+	parser.add_argument('--directory-to-scan', type=str, help='Local directory to scan')
 
 	args = parser.parse_args()
-	print(args)
-
-	repo_url = args.repository_url
+	
+	repo_url = args.repository
 	email_flag = args.send_email
 	email_address = args.email_address
 	branch = args.branch
-	
-	clone_repository(repo_url, branch)
-	generate_SBOM(repo_url)
+	directory_to_scan = args.directory_to_scan
+
+	if (repo_url):
+		clone_repository(repo_url, branch)
+		directory_to_scan = get_repository_local_directory_name(repo_url)
+
+	generate_SBOM(directory_to_scan)
 	vulnerabilities_output = generate_vulnerability_report()
+
+	print(vulnerabilities_output)
 	
 	if (email_flag and email_address is not None):
 		send_email(email_address, generate_html_table(vulnerabilities_output))
