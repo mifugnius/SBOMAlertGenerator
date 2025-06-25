@@ -3,13 +3,21 @@ import subprocess
 import shutil
 import argparse
 import sys
+import json
+import threading
+import psutil
+import time
+import linecache
 from utils.email_utils import send_email
+from utils.report_util import create_security_report_pdf
+from utils.models.SMTP_parameters import SMTP_parameters
 
 TMP_DIRECTORY_SUBPATH = '/tmp/'
 
 SBOM_FILE_NAME = "sbom.json"
 
-TABLE_COLUMN_COUNT = 8
+max_rss = 0
+max_rss_info = {}
 
 # VILNERABILITY_REPORT_FILE_NAME = "vulnerability_report.json"
 
@@ -49,34 +57,13 @@ def clone_repository(repo_url, branch):
 
 def generate_SBOM(directory):
 	result = subprocess.run(["syft", directory, "-o", "json"], stdout=subprocess.PIPE, check=True)
+
+	sbom_data = json.loads(result.stdout)
+
+	readable_json_string = json.dumps(sbom_data, indent=4)
 	
-	with open(SBOM_FILE_NAME, "wb") as f:
-		f.write(result.stdout)
-
-def generate_html_table(vulnerabilities_table_string):
-	lines = vulnerabilities_table_string.strip().split("\n")
-	html = '<table border="1" cellpadding="5" cellspacing="0" style="border-collapse:collapse; font-family:sans-serif;">'
-
-	header = lines[0].split()
-	html += ("<thead><tr>" + "".join(f"<th>{header_row}</th>" for header_row in header) + "</tr></thead>")
-
-	html += "<tbody>"
-	
-	for line in lines[1:]:
-		columns = line.split(None, len(header) - 1)
-
-		# Add empty column if FIXED-IN is empty
-		if (len(columns) < TABLE_COLUMN_COUNT):
-			columns.insert(2, "")
-
-		# Make Vulnerability column into a OSV hyperlink
-		columns[4] = f'<a href="https://osv.dev/vulnerability/{columns[4]}" target="_blank">{columns[4]}</a>'
-		
-		html += ("<tr>" + "".join(f"<td>{column}</td>" for column in columns) + "</tr>")
-
-	html += "</tbody></table>"
-
-	return html
+	with open(SBOM_FILE_NAME, "w", encoding="utf-8") as f:
+		f.write(readable_json_string)
 
 def generate_vulnerability_report():
 	result = subprocess.run(["grype", f"sbom:{SBOM_FILE_NAME}", "-o", "table"], stdout=subprocess.PIPE, check=True, text=True)
@@ -85,14 +72,49 @@ def generate_vulnerability_report():
 def repository_has_vulnerabilities(output):
 	return output != "No vulnerabilities found\n"
 
+def track_memory():
+    global max_rss, max_rss_info
+    process = psutil.Process(os.getpid())
+    while True:
+        rss = process.memory_info().rss
+        if rss > max_rss:
+            max_rss = rss
+            # Copy last trace location
+            info = max_rss_info.copy()
+            print(f"\n[MEMORY PEAK] {rss / 1024**2:.2f} MB")
+            if info:
+                print(f"  ↳ At {info['filename']}:{info['lineno']}")
+                line = linecache.getline(info['filename'], info['lineno']).strip()
+                print(f"  ↳ Line: {line}")
+        time.sleep(0.01)
+
+def trace_calls(frame, event, arg):
+    if event == 'line':
+        max_rss_info['filename'] = frame.f_code.co_filename
+        max_rss_info['lineno'] = frame.f_lineno
+    return trace_calls
+
+def start_tracing():
+    sys.settrace(trace_calls)
+    threading.settrace(trace_calls)
+
 def main():
+	# Uncomment for memory usage tracking
+	# threading.Thread(target=track_memory, daemon=True).start()
+
 	parser = argparse.ArgumentParser(description="SBOMAlertGenerator: Generate Alerts for a Repository")
 
 	parser.add_argument('--repository', type=str, help='URL of the Git repository to analyze')
 	parser.add_argument('--branch', type=str, help='Repository branch to analyze')
-	parser.add_argument('--no-email', action='store_false', dest='send_email', help='Disable sending email (used when --email-address is not specified)')
+	parser.add_argument('-n', '--no-email', action='store_false', dest='send_email', help='Disable sending email (used when --email-address is not specified)')
 	parser.add_argument('--email-address', type=str, help='Email address to send alerts to (used when --no-email is not specified)')
 	parser.add_argument('--directory-to-scan', type=str, help='Local directory to scan')
+	parser.add_argument('--smtp-server-name', type=str, help='SMTP server name (required if no .env configuration)')
+	parser.add_argument('--smtp-port', type=str, help='SMTP server port (required if no .env configuration)')
+	parser.add_argument('--smtp-username', type=str, help='SMTP username (required if no .env configuration)')
+	parser.add_argument('--smtp-master-password', type=str, help='SMTP server master password (required if no .env configuration)')
+	parser.add_argument('--email-from', type=str, help='Email to send email from (required if no .env configuration)')
+
 
 	args = parser.parse_args()
 	
@@ -101,6 +123,14 @@ def main():
 	email_address = args.email_address
 	branch = args.branch
 	directory_to_scan = args.directory_to_scan
+
+	# no .env (CI) properties
+	env_config = SMTP_parameters(
+		args.smtp_server_name, 
+		args.smtp_port, 
+		args.smtp_username, 
+		args.smtp_master_password, 
+		args.email_from)
 
 	if (repo_url):
 		clone_repository(repo_url, branch)
@@ -112,7 +142,11 @@ def main():
 	print(vulnerabilities_output)
 	
 	if (email_flag and email_address is not None):
-		send_email(email_address, generate_html_table(vulnerabilities_output))
+		create_security_report_pdf(vulnerabilities_output, os.path.basename(directory_to_scan))
+		send_email(email_address, env_config)
+
+	# Uncomment for memory usage tracking
+	#print(f"max: {max_rss}")
 
 	sys.exit(1 if repository_has_vulnerabilities(vulnerabilities_output) else 0)
 
